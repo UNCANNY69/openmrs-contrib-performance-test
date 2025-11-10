@@ -8,38 +8,73 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    # Use a per-run project name so volumes and containers are isolated between runs
     env:
+      COMPOSE_PROJECT_NAME: openmrs_${{ github.run_id }}
       SIMULATION_PRESET: dev
       TIER_DURATION_MINUTES: 30
       USER_INCREMENT_PER_TIER: 2
       TIER_COUNT: 1
 
+      # These should be set in the repository / organization Secrets:
+      # - DB_USER
+      # - DB_PASS
+      # - DB_NAME
+      # - MYSQL_ROOT_PASSWORD
+      # Provide defaults only for local convenience (not recommended for production secrets)
+      DB_USER: ${{ secrets.DB_USER || 'openmrs' }}
+      DB_PASS: ${{ secrets.DB_PASS || 'openmrs' }}
+      DB_NAME: ${{ secrets.DB_NAME || 'openmrs' }}
+      MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD || 'openmrs' }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Ensure any old compose stack for the same repo is down (safe noop if none)
+      - name: Ensure previous compose is down (safe)
+        run: |
+          docker compose -f src/test/resources/docker-compose.yml down --remove-orphans || true
+
       - name: Start an OpenMRS instance
         run: docker compose -f src/test/resources/docker-compose.yml up -d
 
-      # 🆕 Add this step: Wait for MySQL to be ready
-      - name: Wait for MySQL
+      - name: Wait for MySQL to be healthy
         run: |
-          until docker exec $(docker ps -q --filter ancestor=mariadb:10.11.7) \
-            mysqladmin ping -uroot -p${MYSQL_ROOT_PASSWORD:-openmrs} --silent; do sleep 1; done
+          set -euo pipefail
+          # get the db container id using compose project name and service name 'db'
+          DB_CONTAINER=$(docker compose -f src/test/resources/docker-compose.yml ps -q db)
+          if [ -z "$DB_CONTAINER" ]; then
+            echo "ERROR: DB container not found; listing containers for debugging:"
+            docker ps --format 'table {{.ID}}\t{{.Image}}\t{{.Names}}'
+            exit 1
+          fi
 
-      # 🆕 Add this step: Reset database to a clean state (and optionally load dump)
-      - name: Reset DB
-        env:
-          MYSQL_PWD: ${MYSQL_ROOT_PASSWORD:-openmrs}
+          echo "Waiting for MySQL in container $DB_CONTAINER to be ready..."
+          # Wait until mysqladmin ping works
+          until docker exec "$DB_CONTAINER" mysqladmin ping -uroot -p"${MYSQL_ROOT_PASSWORD}" --silent; do
+            sleep 1
+          done
+          echo "MySQL is ready."
+
+      - name: Reset DB (drop/create) and optionally import dump.sql
         run: |
-          DB_CONTAINER=$(docker ps -q --filter ancestor=mariadb:10.11.7)
-          # Drop and recreate the openmrs database
-          docker exec $DB_CONTAINER mysql -uroot -e \
-            "DROP DATABASE IF EXISTS openmrs; CREATE DATABASE openmrs CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+          set -euo pipefail
+          DB_CONTAINER=$(docker compose -f src/test/resources/docker-compose.yml ps -q db)
+          echo "Using DB container: $DB_CONTAINER"
+          # Drop and recreate the DB (clean slate)
+          docker exec "$DB_CONTAINER" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -e \
+            "DROP DATABASE IF EXISTS \`${DB_NAME}\`; CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+          echo "Database ${DB_NAME} recreated."
 
-          # Optional: if you have a dump.sql that initializes tables
-          if [ -f src/test/resources/dump/dump.sql ]; then
-            docker exec -i $DB_CONTAINER mysql -uroot -p${MYSQL_ROOT_PASSWORD:-openmrs} openmrs < src/test/resources/dump/dump.sql
+          # If repo includes a dump file at src/test/resources/dump/dump.sql, import it
+          DUMP_PATH="src/test/resources/dump/dump.sql"
+          if [ -f "$DUMP_PATH" ]; then
+            echo "Importing dump from $DUMP_PATH into ${DB_NAME}..."
+            docker exec -i "$DB_CONTAINER" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" "${DB_NAME}" < "$DUMP_PATH"
+            echo "Import finished."
+          else
+            echo "No dump found at $DUMP_PATH — skipping import."
           fi
 
       - name: Set up Java
@@ -52,7 +87,20 @@ jobs:
         run: ./mvnw install -DskipTests
 
       - name: Wait for the OpenMRS instance to start
-        run: while [[ "$(curl -s -o /dev/null -w ''%{http_code}'' http://localhost/openmrs/login.htm)" != "200" ]]; do sleep 10; done
+        run: |
+          # Wait until the application returns HTTP 200 at /openmrs/login.htm
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost/openmrs/login.htm || true)
+            if [ "$code" = "200" ]; then
+              echo "OpenMRS started (HTTP 200)."
+              exit 0
+            fi
+            echo "Waiting for OpenMRS to start... (attempt $i, status $code)"
+            sleep 10
+          done
+          echo "OpenMRS did not start in time."
+          docker-compose -f src/test/resources/docker-compose.yml ps || true
+          exit 1
 
       - name: Get System Information
         run: |
@@ -65,14 +113,32 @@ jobs:
       - name: Run performance tests
         run: ./mvnw gatling:test -Dgatling.runDescription="${{ env.GATLING_RUN_DESCRIPTION }}"
 
-      - name: Stop the OpenMRS instance
-        if: '!cancelled()'
-        run: docker stop $(docker ps -a -q)
+      - name: Gather DB dump (optional - create a dump artifact of the fresh DB)
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p dumps
+          DB_CONTAINER=$(docker compose -f src/test/resources/docker-compose.yml ps -q db)
+          # produce a fresh dump so you can inspect test DB state (safeguard: don't upload production data)
+          docker exec -i "$DB_CONTAINER" sh -c "exec mysqldump -uroot -p'${MYSQL_ROOT_PASSWORD}' --databases '${DB_NAME}'" > dumps/dump-after-run.sql || true
+        shell: bash
 
-      - name: Upload test results
+      - name: Stop and remove containers
+        if: always()
+        run: docker compose -f src/test/resources/docker-compose.yml down --remove-orphans
+
+      - name: Upload Gatling report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: report
+          name: gatling-report
           path: target/gatling
           retention-days: 30
+
+      - name: Upload DB dump artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-dump
+          path: dumps/dump-after-run.sql
+          retention-days: 7
