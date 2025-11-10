@@ -1,106 +1,118 @@
-name: Run Performance Tests on Single User
+name: Run Performance Tests (DB-first, no passwords)
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
-  workflow_dispatch:
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    # Use a per-run project name so volumes and containers are isolated between runs
     env:
+      # Isolate per-run compose project
       COMPOSE_PROJECT_NAME: openmrs_${{ github.run_id }}
+
       SIMULATION_PRESET: dev
       TIER_DURATION_MINUTES: 30
       USER_INCREMENT_PER_TIER: 2
       TIER_COUNT: 1
 
-      # These should be set in the repository / organization Secrets:
-      # - DB_USER
-      # - DB_PASS
-      # - DB_NAME
-      # - MYSQL_ROOT_PASSWORD
-      # Provide defaults only for local convenience (not recommended for production secrets)
-      DB_USER: ${{ secrets.DB_USER || 'openmrs' }}
-      DB_PASS: ${{ secrets.DB_PASS || 'openmrs' }}
-      DB_NAME: ${{ secrets.DB_NAME || 'openmrs' }}
-      MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD || 'openmrs' }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Ensure any old compose stack for the same repo is down (safe noop if none)
-      - name: Ensure previous compose is down (safe)
-        run: |
-          docker compose -f src/test/resources/docker-compose.yml down --remove-orphans || true
-
-      - name: Start an OpenMRS instance
-        run: docker compose -f src/test/resources/docker-compose.yml up -d
-
-      - name: Wait for MySQL to be healthy
+      - name: Ensure previous compose stacks and volumes are removed (CI-safe)
         run: |
           set -euo pipefail
-          # get the db container id using compose project name and service name 'db'
-          DB_CONTAINER=$(docker compose -f src/test/resources/docker-compose.yml ps -q db)
+          COMPOSE_FILE=src/test/resources/docker-compose.yml
+          PROJECT="${COMPOSE_PROJECT_NAME}"
+          echo "Bringing down any existing compose project: $PROJECT"
+          docker compose -f "$COMPOSE_FILE" -p "$PROJECT" down --remove-orphans --volumes || true
+
+          # Explicitly remove the named DB volume if it exists (safe on hosted runners)
+          VOLUME_NAME="${PROJECT}_db-data"
+          echo "Attempting to remove volume: $VOLUME_NAME"
+          docker volume rm -f "$VOLUME_NAME" || true
+        shell: bash
+
+      - name: Start only DB service
+        run: |
+          set -euo pipefail
+          COMPOSE_FILE=src/test/resources/docker-compose.yml
+          PROJECT="${COMPOSE_PROJECT_NAME}"
+          echo "Starting DB service only for project $PROJECT..."
+          docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d db
+        shell: bash
+
+      - name: Wait for DB to be ready (no password used)
+        run: |
+          set -euo pipefail
+          COMPOSE_FILE=src/test/resources/docker-compose.yml
+          PROJECT="${COMPOSE_PROJECT_NAME}"
+          DB_CONTAINER=$(docker compose -f "$COMPOSE_FILE" -p "$PROJECT" ps -q db)
           if [ -z "$DB_CONTAINER" ]; then
-            echo "ERROR: DB container not found; listing containers for debugging:"
+            echo "ERROR: DB container not found" >&2
             docker ps --format 'table {{.ID}}\t{{.Image}}\t{{.Names}}'
             exit 1
           fi
+          echo "DB container id: $DB_CONTAINER"
 
-          echo "Waiting for MySQL in container $DB_CONTAINER to be ready..."
-          # Wait until mysqladmin ping works
-          until docker exec "$DB_CONTAINER" mysqladmin ping -uroot -p"${MYSQL_ROOT_PASSWORD}" --silent; do
+          # Try quick mysqladmin ping (without password). If that fails, fall back to scanning logs for a 'ready' message.
+          echo "Trying mysqladmin ping (no password)..."
+          if docker exec "$DB_CONTAINER" mysqladmin ping --silent >/dev/null 2>&1; then
+            echo "mysqladmin reports DB alive."
+            exit 0
+          fi
+
+          echo "mysqladmin ping failed without password — falling back to log scanning."
+          TRIES=0
+          until docker logs "$DB_CONTAINER" --tail 200 2>&1 | grep -qiE "ready for connections|Server socket created|ready for connections|listening on|ready to accept connections"; do
+            TRIES=$((TRIES+1))
+            echo "Waiting for DB ready indicator in logs (attempt $TRIES)..."
+            if [ $TRIES -ge 120 ]; then
+              echo "DB did not report ready in time; dumping last 200 log lines:" >&2
+              docker logs "$DB_CONTAINER" --tail 200 || true
+              exit 1
+            fi
             sleep 1
           done
-          echo "MySQL is ready."
+          echo "DB logs show a ready indicator."
+        shell: bash
 
-      - name: Reset DB (drop/create) and optionally import dump.sql
+      - name: Start remaining services (backend, frontend, gateway)
         run: |
           set -euo pipefail
-          DB_CONTAINER=$(docker compose -f src/test/resources/docker-compose.yml ps -q db)
-          echo "Using DB container: $DB_CONTAINER"
-          # Drop and recreate the DB (clean slate)
-          docker exec "$DB_CONTAINER" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -e \
-            "DROP DATABASE IF EXISTS \`${DB_NAME}\`; CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
-          echo "Database ${DB_NAME} recreated."
-
-          # If repo includes a dump file at src/test/resources/dump/dump.sql, import it
-          DUMP_PATH="src/test/resources/dump/dump.sql"
-          if [ -f "$DUMP_PATH" ]; then
-            echo "Importing dump from $DUMP_PATH into ${DB_NAME}..."
-            docker exec -i "$DB_CONTAINER" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" "${DB_NAME}" < "$DUMP_PATH"
-            echo "Import finished."
-          else
-            echo "No dump found at $DUMP_PATH — skipping import."
-          fi
+          COMPOSE_FILE=src/test/resources/docker-compose.yml
+          PROJECT="${COMPOSE_PROJECT_NAME}"
+          echo "Starting backend, frontend, gateway..."
+          docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d backend frontend gateway
+        shell: bash
 
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'adopt'
+          distribution: 'temurin'
           java-version: '17'
 
       - name: Install dependencies
         run: ./mvnw install -DskipTests
 
-      - name: Wait for the OpenMRS instance to start
+      - name: Wait for OpenMRS to be reachable
         run: |
-          # Wait until the application returns HTTP 200 at /openmrs/login.htm
+          set -euo pipefail
           for i in $(seq 1 60); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost/openmrs/login.htm || true)
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost/openmrs/login.htm || echo "000")
+            echo "HTTP status: $code (attempt $i)"
             if [ "$code" = "200" ]; then
-              echo "OpenMRS started (HTTP 200)."
+              echo "OpenMRS is up."
               exit 0
             fi
-            echo "Waiting for OpenMRS to start... (attempt $i, status $code)"
             sleep 10
           done
-          echo "OpenMRS did not start in time."
-          docker-compose -f src/test/resources/docker-compose.yml ps || true
+          echo "OpenMRS did not start in time." >&2
+          docker compose -f src/test/resources/docker-compose.yml -p "${COMPOSE_PROJECT_NAME}" ps || true
           exit 1
+        shell: bash
 
       - name: Get System Information
         run: |
@@ -109,23 +121,15 @@ jobs:
           total_disk=$(df -h / | grep / | awk '{print $2}')
           description="Executed on a GitHub Actions runner with ${total_ram} RAM, ${num_cpus} CPUs, and ${total_disk} disk space."
           echo "GATLING_RUN_DESCRIPTION=${description}" >> $GITHUB_ENV
+        shell: bash
 
       - name: Run performance tests
         run: ./mvnw gatling:test -Dgatling.runDescription="${{ env.GATLING_RUN_DESCRIPTION }}"
 
-      - name: Gather DB dump (optional - create a dump artifact of the fresh DB)
-        if: always()
-        run: |
-          set -euo pipefail
-          mkdir -p dumps
-          DB_CONTAINER=$(docker compose -f src/test/resources/docker-compose.yml ps -q db)
-          # produce a fresh dump so you can inspect test DB state (safeguard: don't upload production data)
-          docker exec -i "$DB_CONTAINER" sh -c "exec mysqldump -uroot -p'${MYSQL_ROOT_PASSWORD}' --databases '${DB_NAME}'" > dumps/dump-after-run.sql || true
-        shell: bash
-
       - name: Stop and remove containers
         if: always()
-        run: docker compose -f src/test/resources/docker-compose.yml down --remove-orphans
+        run: docker compose -f src/test/resources/docker-compose.yml -p "${COMPOSE_PROJECT_NAME}" down --remove-orphans --volumes
+        shell: bash
 
       - name: Upload Gatling report
         if: always()
@@ -134,11 +138,3 @@ jobs:
           name: gatling-report
           path: target/gatling
           retention-days: 30
-
-      - name: Upload DB dump artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: db-dump
-          path: dumps/dump-after-run.sql
-          retention-days: 7
