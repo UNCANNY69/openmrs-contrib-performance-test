@@ -31,11 +31,8 @@ services:
       - db
     environment:
       OMRS_CONFIG_MODULE_WEB_ADMIN: "true"
-      # --- MODIFIED ---
-      # Set to false because the new DB image already has tables and data
-      OMRS_CONFIG_AUTO_UPDATE_DATABASE: "false"
-      OMRS_CONFIG_CREATE_TABLES: "false"
-      # --- END MODIFIED ---
+      OMRS_CONFIG_AUTO_UPDATE_DATABASE: "true"
+      OMRS_CONFIG_CREATE_TABLES: "true"
       OMRS_CONFIG_CONNECTION_SERVER: db
       OMRS_CONFIG_CONNECTION_DATABASE: openmrs
       OMRS_CONFIG_CONNECTION_USERNAME: ${OPENMRS_DB_USER:-openmrs}
@@ -46,15 +43,27 @@ services:
     volumes:
       - openmrs-data:/openmrs/data
 
-  # --- MODIFIED ---
-  # This entire service is replaced with the pre-built image.
-  # All environment, command, volumes, and ports are removed
-  # because they are pre-configured inside the new image.
+  # MariaDB
   db:
-    image: openmrs/openmrs-reference-application-3-db:nightly-with-data
+    image: mariadb:10.11.7
     restart: "unless-stopped"
-  # --- END MODIFIED ---
+    command: "mysqld --character-set-server=utf8mb4 --collation-server=utf8mb4_general_ci"
+    healthcheck:
+      test: "mysql --user=${OMRS_DB_USER:-openmrs} --password=${OMRS_DB_PASSWORD:-openmrs} --execute \"SHOW DATABASES;\""
+      interval: 3s
+      timeout: 1s
+      retries: 5
+    environment:
+      MYSQL_DATABASE: openmrs
+      MYSQL_USER: ${OMRS_DB_USER:-openmrs}
+      MYSQL_PASSWORD: ${OMRS_DB_PASSWORD:-openmrs}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-openmrs}
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./dump:/docker-entrypoint-initdb.d
+    ports:
+      - "3306:3306"
 
 volumes:
   openmrs-data: ~
-  # 'db-data' is no longer needed as the new db service is ephemeral
+  db-data: ~

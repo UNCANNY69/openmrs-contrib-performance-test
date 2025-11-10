@@ -21,6 +21,27 @@ jobs:
       - name: Start an OpenMRS instance
         run: docker compose -f src/test/resources/docker-compose.yml up -d
 
+      # 🆕 Add this step: Wait for MySQL to be ready
+      - name: Wait for MySQL
+        run: |
+          until docker exec $(docker ps -q --filter ancestor=mariadb:10.11.7) \
+            mysqladmin ping -uroot -p${MYSQL_ROOT_PASSWORD:-openmrs} --silent; do sleep 1; done
+
+      # 🆕 Add this step: Reset database to a clean state (and optionally load dump)
+      - name: Reset DB
+        env:
+          MYSQL_PWD: ${MYSQL_ROOT_PASSWORD:-openmrs}
+        run: |
+          DB_CONTAINER=$(docker ps -q --filter ancestor=mariadb:10.11.7)
+          # Drop and recreate the openmrs database
+          docker exec $DB_CONTAINER mysql -uroot -e \
+            "DROP DATABASE IF EXISTS openmrs; CREATE DATABASE openmrs CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+
+          # Optional: if you have a dump.sql that initializes tables
+          if [ -f src/test/resources/dump/dump.sql ]; then
+            docker exec -i $DB_CONTAINER mysql -uroot -p${MYSQL_ROOT_PASSWORD:-openmrs} openmrs < src/test/resources/dump/dump.sql
+          fi
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
@@ -35,19 +56,10 @@ jobs:
 
       - name: Get System Information
         run: |
-          # Get RAM information
           total_ram=$(free -h | grep Mem | awk '{print $2}')
-          
-          # Get number of CPUs
           num_cpus=$(nproc)
-          
-          # Get disk space information
           total_disk=$(df -h / | grep / | awk '{print $2}')
-          
-          # Format the description
-          description="Executed on a GitHub Actions runner with ${total_ram} RAM, ${num_cpus}CPUs, and ${total_disk} disk space."
-          
-          # Set the description as an environment variable
+          description="Executed on a GitHub Actions runner with ${total_ram} RAM, ${num_cpus} CPUs, and ${total_disk} disk space."
           echo "GATLING_RUN_DESCRIPTION=${description}" >> $GITHUB_ENV
 
       - name: Run performance tests
